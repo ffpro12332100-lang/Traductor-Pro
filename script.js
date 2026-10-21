@@ -32,7 +32,7 @@ const btnFontDec = document.getElementById('btn-font-dec');
 const toastMsg = document.getElementById('toast-msg');
 const toastText = document.getElementById('toast-text');
 
-// Estado y Caché en memoria para red ultralenta u offline
+// Estado global y memorias
 let debounceTimer = null;
 let detectedLanguageCode = 'es';
 let isRecording = false;
@@ -41,8 +41,21 @@ let speechSpeed = 1.0;
 let currentFontSize = 16;
 let activeAbortController = null;
 let preMicText = ''; 
+let lastTrimmedText = ''; // Almacena el texto limpio anterior para no re-traducir con solo espacios
 
-// Memoria local ultrarrápida (Caché offline)
+// Restaurar idiomas guardados
+try {
+    const savedSource = localStorage.getItem('neo_trans_source');
+    const savedTarget = localStorage.getItem('neo_trans_target');
+    if (savedSource && Array.from(sourceLang.options).some(o => o.value === savedSource)) {
+        sourceLang.value = savedSource;
+    }
+    if (savedTarget && Array.from(targetLang.options).some(o => o.value === savedTarget)) {
+        targetLang.value = savedTarget;
+    }
+} catch(e) {}
+
+// Caché de traducciones e historial
 const translationCache = new Map();
 let translationHistory = [];
 try {
@@ -51,7 +64,7 @@ try {
     translationHistory = [];
 }
 
-// API de Voz con Fallback seguro
+// API de Voz
 const synth = ('speechSynthesis' in window) ? window.speechSynthesis : null;
 const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition || null;
 
@@ -67,23 +80,65 @@ function showToast(msg) {
     setTimeout(() => toastMsg.classList.remove('show'), 2500);
 }
 
-// SISTEMA INTELIGENTE DE AUTO-PUNTUACIÓN Y GRAMÁTICA
-function applySmartPunctuation(str, lang = 'es') {
+// Persistir idioma seleccionado al cambiar
+sourceLang.addEventListener('change', () => {
+    try { localStorage.setItem('neo_trans_source', sourceLang.value); } catch(e) {}
+    if (inputText.value.trim()) translateText();
+});
+
+targetLang.addEventListener('change', () => {
+    try { localStorage.setItem('neo_trans_target', targetLang.value); } catch(e) {}
+    if (inputText.value.trim()) translateText();
+});
+
+// INTERCAMBIO DE IDIOMAS (Funciona SIEMPRE, con o sin texto)
+swapBtn.addEventListener('click', () => {
+    let currentSource = sourceLang.value;
+    let currentTarget = targetLang.value;
+
+    if (currentSource === 'autodetect') {
+        currentSource = detectedLanguageCode || 'es';
+    }
+
+    const canAssignSource = Array.from(sourceLang.options).some(o => o.value === currentTarget);
+    const canAssignTarget = Array.from(targetLang.options).some(o => o.value === currentSource);
+
+    if (canAssignSource) sourceLang.value = currentTarget;
+    if (canAssignTarget) targetLang.value = currentSource;
+
+    // Guardar los nuevos idiomas intercambiados
+    try {
+        localStorage.setItem('neo_trans_source', sourceLang.value);
+        localStorage.setItem('neo_trans_target', targetLang.value);
+    } catch(e) {}
+
+    const currentInput = inputText.value;
+    const currentOutput = outputText.value;
+
+    if (currentOutput.trim()) {
+        inputText.value = currentOutput;
+        outputText.value = currentInput;
+        lastTrimmedText = currentOutput.trim();
+        updateCounters();
+        translateText();
+    } else if (inputText.value.trim()) {
+        translateText();
+    }
+});
+
+// Auto-puntuación
+function applySmartPunctuation(str) {
     if (!str || !str.trim()) return str;
 
     let text = str.trim();
-
-    // 1. Mayúscula inicial
     text = text.charAt(0).toUpperCase() + text.slice(1);
 
-    // 2. Colocar comas tras conectores habituales en español e inglés
     const connectorRegexEs = /\b(sin embargo|por lo tanto|además|por ejemplo|en efecto|por favor)\b(?!\s*,)/gi;
     text = text.replace(connectorRegexEs, '$1,');
 
     const connectorRegexEn = /\b(however|therefore|besides|for example|in fact|please)\b(?!\s*,)/gi;
     text = text.replace(connectorRegexEn, '$1,');
 
-    // 3. Detección Inteligente de Preguntas (Español)
     const questionWordsEs = [
         'qué', 'que', 'cómo', 'como', 'cuándo', 'cuando', 'dónde', 'donde', 
         'por qué', 'porque', 'quién', 'quien', 'quiénes', 'quienes', 
@@ -102,7 +157,6 @@ function applySmartPunctuation(str, lang = 'es') {
         else if (text.endsWith('.')) text = text.slice(0, -1) + '?';
     }
 
-    // 4. Detección Inteligente de Preguntas (Inglés)
     const questionWordsEn = [
         'what', 'why', 'where', 'when', 'who', 'whom', 'how', 'which', 
         'can you', 'could you', 'would you', 'is it', 'are you', 'do you', 'does it'
@@ -120,7 +174,7 @@ function applySmartPunctuation(str, lang = 'es') {
     return text;
 }
 
-// Inicialización optimizada de reconocimiento de voz
+// Speech Recognition Init
 if (!SpeechRecognition) {
     btnMic.style.opacity = '0.4';
     btnMic.title = 'Reconocimiento de voz no soportado por este navegador';
@@ -164,7 +218,7 @@ if (!SpeechRecognition) {
             isRecording = false;
             btnMic.classList.remove('recording');
             if (inputText.value.trim()) {
-                inputText.value = applySmartPunctuation(inputText.value, sourceLang.value);
+                inputText.value = applySmartPunctuation(inputText.value);
                 updateCounters();
                 triggerDebouncedTranslate();
             }
@@ -181,70 +235,51 @@ function updateCounters() {
     wordNum.textContent = words;
 }
 
-// CONTROLADOR DE DEBOUNCE / TIEMPO DE ESPERA TRAS ESCRIBIR SEGUIDO
+// CONTROLADOR DE DEBOUNCE - IGNORA SI SOLO CAMBIARON ESPACIOS
 inputText.addEventListener('input', () => {
     updateCounters();
+    
+    const currentTrimmed = inputText.value.trim();
+    
+    // Si el texto con trim no cambia (solo agregaron/quitaron espacios en los extremos o dobles espacios internos)
+    if (currentTrimmed === lastTrimmedText) {
+        if (!currentTrimmed) {
+            outputText.value = '';
+            setStatus('Traduciendo...', false);
+        }
+        return; 
+    }
+    
     triggerDebouncedTranslate();
 });
 
 function triggerDebouncedTranslate() {
     clearTimeout(debounceTimer);
     const text = inputText.value;
+    const currentTrimmed = text.trim();
 
-    if (!text.trim()) {
+    if (!currentTrimmed) {
+        lastTrimmedText = '';
         outputText.value = '';
         setStatus('Traduciendo...', false);
         return;
     }
 
-    // Notificación visual rápida de pausa esperada si se escribe velozmente
     setStatus('Pausando para traducir...', true);
 
-    // Ajuste dinámico de retardo de debounce según longitud de cadena (entre 650ms y 1200ms)
-    const len = text.length;
-    let waitTime = 700; 
-    if (len > 3000) waitTime = 1200;
-    else if (len > 800) waitTime = 950;
+    const len = currentTrimmed.length;
+    let waitTime = 550; 
+    if (len > 3000) waitTime = 1000;
+    else if (len > 800) waitTime = 750;
 
     debounceTimer = setTimeout(() => {
+        lastTrimmedText = currentTrimmed;
         translateText();
     }, waitTime);
 }
 
-sourceLang.addEventListener('change', () => { if(inputText.value.trim()) translateText(); });
-targetLang.addEventListener('change', () => { if(inputText.value.trim()) translateText(); });
-
-// INTERCAMBIO DE IDIOMAS CORREGIDO (SIN BORRAR EL TEXTO)
-swapBtn.addEventListener('click', () => {
-    const currentInput = inputText.value;
-    const currentOutput = outputText.value;
-
-    if (!currentInput.trim() && !currentOutput.trim()) return;
-
-    let currentSource = sourceLang.value;
-    let currentTarget = targetLang.value;
-
-    if (currentSource === 'autodetect') {
-        currentSource = detectedLanguageCode || 'es';
-    }
-
-    const canAssignSource = Array.from(sourceLang.options).some(o => o.value === currentTarget);
-    const canAssignTarget = Array.from(targetLang.options).some(o => o.value === currentSource);
-
-    if (canAssignSource) sourceLang.value = currentTarget;
-    if (canAssignTarget) targetLang.value = currentSource;
-
-    if (currentOutput.trim()) {
-        inputText.value = currentOutput;
-        outputText.value = currentInput;
-    }
-
-    updateCounters();
-    if (inputText.value.trim()) translateText();
-});
-
-// Fetch con timeout y reintentos automáticos para soportar las peores conexiones
-async function fetchWithTimeout(url, options = {}, timeoutMs = 6500) {
+// FETCH CON TIMEOUT
+async function fetchWithTimeout(url, options = {}, timeoutMs = 6000) {
     const controller = new AbortController();
     const id = setTimeout(() => controller.abort(), timeoutMs);
     try {
@@ -272,12 +307,11 @@ function anySignal(signals) {
     return controller.signal;
 }
 
-// DIVISOR INTELIGENTE PARA CUALQUIER TIPO DE CADENA (Código, JSON, Marcado, Párrafos)
+// SPLIT DE TEXTO EN BLOQUES INTELIGENTES
 function splitTextIntoChunks(text, maxChunkLen = 1200) {
     if (text.length <= maxChunkLen) return [text];
 
     const chunks = [];
-    // Preservar estructura dividiendo primariamente por saltos de línea dobles y simples
     const lines = text.split(/(\r?\n)/);
     let currentChunk = "";
 
@@ -288,7 +322,6 @@ function splitTextIntoChunks(text, maxChunkLen = 1200) {
                 currentChunk = "";
             }
             if (part.length > maxChunkLen) {
-                // Dividir por oraciones o símbolos de terminación en cadenas de código
                 const sentences = part.match(/[^.!?;\n]+[.!?;\n]+|[^.!?;\n]+/g) || [part];
                 for (let sentence of sentences) {
                     if ((currentChunk + sentence).length > maxChunkLen) {
@@ -309,17 +342,17 @@ function splitTextIntoChunks(text, maxChunkLen = 1200) {
     return chunks.length > 0 ? chunks : [text];
 }
 
-// PARSER Y DESEMPAQUETADOR DE MOTOR INDIVIDUAL CON SOPORTE UNIVERSAL DE STRINGS
+// MOTORES DE TRADUCCIÓN PARALELOS
 async function translateSingleChunk(textChunk, sLang, tLang, signal) {
     const subCacheKey = `${sLang}|${tLang}|${textChunk}`;
     if (translationCache.has(subCacheKey)) {
         return translationCache.get(subCacheKey);
     }
 
-    // Motor 1: Google GTX Endpoint Avanzado
+    // Motor 1: Google GTX Endpoint
     try {
         const gUrl = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=${sLang}&tl=${tLang}&dt=t&dt=bd&dt=ex&dt=ld&dt=md&dt=qca&dt=rw&dt=rm&dt=ss&dt=at&q=${encodeURIComponent(textChunk)}`;
-        const response = await fetchWithTimeout(gUrl, { signal }, 5500);
+        const response = await fetchWithTimeout(gUrl, { signal }, 5000);
         if (response.ok) {
             const data = await response.json();
             if (data && data[0]) {
@@ -336,7 +369,7 @@ async function translateSingleChunk(textChunk, sLang, tLang, signal) {
     // Motor 2: Google Chrome Client Fallback
     try {
         const gUrl2 = `https://translate.googleapis.com/translate_a/single?client=dict-chrome-ex&sl=${sLang}&tl=${tLang}&dt=t&q=${encodeURIComponent(textChunk)}`;
-        const response = await fetchWithTimeout(gUrl2, { signal }, 5500);
+        const response = await fetchWithTimeout(gUrl2, { signal }, 5000);
         if (response.ok) {
             const data = await response.json();
             if (data && data[0]) {
@@ -352,7 +385,7 @@ async function translateSingleChunk(textChunk, sLang, tLang, signal) {
     // Motor 3: Lingva Mirror API
     try {
         const lUrl = `https://lingva.ml/api/v1/${sLang}/${tLang}/${encodeURIComponent(textChunk)}`;
-        const response = await fetchWithTimeout(lUrl, { signal }, 5500);
+        const response = await fetchWithTimeout(lUrl, { signal }, 5000);
         if (response.ok) {
             const data = await response.json();
             if (data && data.translation) {
@@ -362,11 +395,11 @@ async function translateSingleChunk(textChunk, sLang, tLang, signal) {
         }
     } catch (e) {}
 
-    // Motor 4: MyMemory Backup de Alta Fidelidad
+    // Motor 4: MyMemory
     try {
         const pair = (sLang === 'auto') ? `Autodetect|${tLang}` : `${sLang}|${tLang}`;
         const mUrl = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(textChunk)}&langpair=${pair}`;
-        const response = await fetchWithTimeout(mUrl, { signal }, 6500);
+        const response = await fetchWithTimeout(mUrl, { signal }, 6000);
         const data = await response.json();
         if (data.responseData && data.responseData.translatedText) {
             const resText = data.responseData.translatedText;
@@ -378,16 +411,15 @@ async function translateSingleChunk(textChunk, sLang, tLang, signal) {
     throw new Error("No network engine responded");
 }
 
-// MOTOR PRINCIPAL TRIPLE CON FRAGMENTACIÓN DE TEXTO Y CACHÉ LOCAL
+// MOTOR PRINCIPAL CON GESTIÓN DE ABORTO
 async function translateText() {
     const text = inputText.value;
     if (!text || !text.trim()) return;
 
     const sLang = sourceLang.value === 'autodetect' ? 'auto' : sourceLang.value;
     const tLang = targetLang.value;
-    const cacheKey = `${sLang}|${tLang}|${text}`;
+    const cacheKey = `${sLang}|${tLang}|${text.trim()}`;
 
-    // 1. Revisar Caché local para la frase completa
     if (translationCache.has(cacheKey)) {
         outputText.value = translationCache.get(cacheKey);
         setStatus('Traduciendo...', false);
@@ -430,7 +462,7 @@ async function translateText() {
                 outputText.value = "[Modo Sin Conexión] Sin acceso a la red de traducción.";
                 showToast("Comprueba tu conexión a internet");
             } else {
-                outputText.value = "Error al conectar con los motores. Reintentando traducción...";
+                outputText.value = "Error al conectar con los motores. Reintentando...";
             }
         }
     } finally {
@@ -440,7 +472,7 @@ async function translateText() {
     }
 }
 
-// REPRODUCCIÓN DE VOZ DE ALTA CAPACIDAD (Soporta Textos Extensos sin Cortarse)
+// SÍNTESIS DE VOZ
 function speakText(text, langCode, buttonElement) {
     if (!text || !text.trim()) {
         showToast("No hay texto para escuchar");
@@ -459,7 +491,6 @@ function speakText(text, langCode, buttonElement) {
             ? (detectedLanguageCode || 'es') 
             : langCode;
 
-        // Dividir en frases para evitar que la API TTS corte el audio en textos largos
         const sentences = text.match(/[^.!?\n]+[.!?\n]+/g) || [text];
         let currentSentenceIndex = 0;
 
@@ -532,6 +563,7 @@ btnSpeedToggle.addEventListener('click', () => {
     showToast(`Velocidad de voz: ${speechSpeed}x`);
 });
 
+// COPIAR TEXTO
 function copyText(text) {
     if (!text.trim()) return;
     if (navigator.clipboard && window.isSecureContext) {
@@ -558,7 +590,7 @@ function fallbackCopy(text) {
 btnCopyInput.addEventListener('click', () => copyText(inputText.value));
 btnCopyOutput.addEventListener('click', () => copyText(outputText.value));
 
-// Menú de Herramientas de texto
+// MENÚ DE HERRAMIENTAS
 btnTools.addEventListener('click', (e) => {
     e.stopPropagation();
     toolsMenu.classList.toggle('show');
@@ -587,17 +619,16 @@ document.getElementById('tool-clean').addEventListener('click', () => {
     triggerDebouncedTranslate();
 });
 
-// Opción inteligente manual de Auto-Puntuación ❓
 document.getElementById('tool-punctuate').addEventListener('click', () => {
     if (inputText.value.trim()) {
-        inputText.value = applySmartPunctuation(inputText.value, sourceLang.value);
+        inputText.value = applySmartPunctuation(inputText.value);
         updateCounters();
         triggerDebouncedTranslate();
         showToast("Puntuación inteligente aplicada");
     }
 });
 
-// Controles de Tamaño de Texto
+// FUENTES
 btnFontInc.addEventListener('click', () => {
     if (currentFontSize < 24) {
         currentFontSize += 2;
@@ -614,10 +645,11 @@ btnFontDec.addEventListener('click', () => {
     }
 });
 
-// Acciones de borrado con basureros SVG
+// BORRADO
 btnClear.addEventListener('click', () => {
     inputText.value = '';
     outputText.value = '';
+    lastTrimmedText = '';
     updateCounters();
     setStatus('Traduciendo...', false);
     if (synth) synth.cancel();
@@ -628,7 +660,7 @@ btnClearOutput.addEventListener('click', () => {
     if (synth) synth.cancel();
 });
 
-// Historial con persistencia segura
+// HISTORIAL
 function saveToHistory(srcText, tgtText, sL, tL) {
     if (!srcText.trim() || srcText.length < 2) return;
     if (translationHistory.length > 0 && translationHistory[0].srcText === srcText) return;
@@ -668,6 +700,7 @@ function renderHistory() {
         el.addEventListener('click', () => {
             inputText.value = item.srcText;
             outputText.value = item.tgtText;
+            lastTrimmedText = item.srcText.trim();
             updateCounters();
             historyModal.classList.remove('open');
         });
@@ -680,7 +713,6 @@ btnHistory.addEventListener('click', () => {
     historyModal.classList.add('open');
 });
 
-// Vaciar todo el historial por completo
 btnClearHistory.addEventListener('click', () => {
     if (translationHistory.length === 0) return;
     translationHistory = [];
